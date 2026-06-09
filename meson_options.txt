@@ -1,0 +1,1 @@
+option('doorbell_project', type : 'string', value : '', description: 'Doorbell-v2 project location (to install binary)')
