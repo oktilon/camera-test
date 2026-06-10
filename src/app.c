@@ -93,6 +93,41 @@ static void nv12_to_rgb_scaled(const uint8_t *y_plane,
     }
 }
 
+static void yuyv_to_rgb_scaled(const uint8_t *src,
+                        uint8_t       *dst,
+                        int src_w, int src_h,
+                        int dst_w, int dst_h,
+                        int rowstride)
+{
+    /* Fixed-point step: how many source pixels per dest pixel */
+    int step_x = (src_w << 16) / dst_w;   // 16-bit fractional
+    int step_y = (src_h << 16) / dst_h;
+
+    int src_y_fp = 0;  // current source row in fixed-point
+    for (int dy = 0; dy < dst_h; dy++, src_y_fp += step_y) {
+
+        int src_row = src_y_fp >> 16;          // integer source row
+
+        const uint8_t *row = src + src_row * src_w * 2;
+        uint8_t       *out = dst + dy * rowstride;
+
+        int src_x_fp = 0;
+        for (int dx = 0; dx < dst_w; dx++, src_x_fp += step_x) {
+
+            int src_col = src_x_fp >> 16;
+            int yuyv_offset = (src_col & ~1) * 2;
+
+            int y = row[yuyv_offset + (src_col & 1 ? 2 : 0)]; /* Y0 or Y1 */
+            int u = row[yuyv_offset + 1] - 128;               /* U shared */
+            int v = row[yuyv_offset + 3] - 128;               /* V shared */
+
+            *out++ = clamp_u8(y + (359 * v >> 8));
+            *out++ = clamp_u8(y - (88 * u >> 8) - (183 * v >> 8));
+            *out++ = clamp_u8(y + (454 * u >> 8));
+        }
+    }
+}
+
 /**
  * @brief Timer callback: Query frame from device and display it
  *
@@ -120,10 +155,12 @@ static gboolean on_frame_timeout(gpointer data) {
     struct v4l2_plane planes[VIDEO_MAX_PLANES];
     memset(planes, 0, sizeof(planes));
     struct v4l2_buffer buf = {0};
-    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    buf.type   = app->type;
     buf.memory = V4L2_MEMORY_MMAP;
-    buf.length = NUM_PLANES;
-    buf.m.planes = planes;
+    if(app->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+        buf.length = NUM_PLANES;
+        buf.m.planes = planes;
+    }
 
     if (xioctl(app->fd, VIDIOC_DQBUF, &buf) == -1) {
         if (errno == EAGAIN) return G_SOURCE_CONTINUE;
@@ -137,20 +174,30 @@ static gboolean on_frame_timeout(gpointer data) {
         guchar *pixels   = gdk_pixbuf_get_pixels(app->pixbuf);
         int     rowstride = gdk_pixbuf_get_rowstride(app->pixbuf);
 
-        nv12_to_rgb_scaled((uint8_t *)app->buffers[buf.index].plane[0].start,
-                        (uint8_t *)app->buffers[buf.index].plane[1].start,
-                            pixels,
-                            app->cap_width, app->cap_height,
-                            app->disp_width, app->disp_height,
-                            rowstride);
+        if(app->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+            nv12_to_rgb_scaled((uint8_t *)app->buffers[buf.index].plane[0].start,
+                            (uint8_t *)app->buffers[buf.index].plane[1].start,
+                                pixels,
+                                app->cap_width, app->cap_height,
+                                app->disp_width, app->disp_height,
+                                rowstride);
+        } else {
+            yuyv_to_rgb_scaled((uint8_t *)app->buffers[buf.index].plane[0].start,
+                                pixels,
+                                app->cap_width, app->cap_height,
+                                app->disp_width, app->disp_height,
+                                rowstride);
+        }
 
         /* Redraw Drawing Area */
         gtk_widget_queue_draw(app->drawing_area);
     }
 
     /* Re-queue the buffer so the kernel can refill it */
-    memset(planes, 0, sizeof(planes));
-    buf.m.planes = planes;
+    if(app->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+        memset(planes, 0, sizeof(planes));
+        buf.m.planes = planes;
+    }
     if (xioctl(app->fd, VIDIOC_QBUF, &buf) == -1) {
         log_message("VIDIOC_QBUF (requeue)");
         return G_SOURCE_REMOVE;
@@ -165,7 +212,7 @@ static gboolean on_frame_timeout(gpointer data) {
  */
 void app_cleanup(AppState *app) {
     /* Stop streaming */
-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    enum v4l2_buf_type type = app->type;
     xioctl(app->fd, VIDIOC_STREAMOFF, &type);
 
     /* Unmap buffers */
@@ -340,19 +387,29 @@ int app_init(AppState *app, const char *dev_name) {
 
     // Set frame format
     struct v4l2_format fmt = {0};
-    fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    fmt.fmt.pix_mp.width       = CAPTURE_WIDTH;
-    fmt.fmt.pix_mp.height      = CAPTURE_HEIGHT;
-    fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
-    fmt.fmt.pix_mp.field       = V4L2_FIELD_NONE;
-    // NV12 has 2 planes: Y plane (full resolution) and interleaved UV plane (half resolution)
-    fmt.fmt.pix_mp.num_planes  = 2;
-    // NV12 plane 0 full resolution (Luma Y)
-    fmt.fmt.pix_mp.plane_fmt[0].sizeimage = CAPTURE_WIDTH * CAPTURE_HEIGHT;
-    fmt.fmt.pix_mp.plane_fmt[0].bytesperline = CAPTURE_WIDTH;
-    // NV12 plane 1 half resolution (Chroma UV)
-    fmt.fmt.pix_mp.plane_fmt[1].sizeimage = CAPTURE_WIDTH * CAPTURE_HEIGHT / 2;
-    fmt.fmt.pix_mp.plane_fmt[1].bytesperline = CAPTURE_WIDTH;
+    if (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
+        app->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        fmt.type                   = app->type;
+        fmt.fmt.pix.width          = CAPTURE_WIDTH;
+        fmt.fmt.pix.height         = CAPTURE_HEIGHT;
+        fmt.fmt.pix.pixelformat    = V4L2_PIX_FMT_YUYV;
+        fmt.fmt.pix.field          = V4L2_FIELD_NONE;
+    } else {
+        app->type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        fmt.type                   = app->type;
+        fmt.fmt.pix_mp.width       = CAPTURE_WIDTH;
+        fmt.fmt.pix_mp.height      = CAPTURE_HEIGHT;
+        fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+        fmt.fmt.pix_mp.field       = V4L2_FIELD_NONE;
+        // NV12 has 2 planes: Y plane (full resolution) and interleaved UV plane (half resolution)
+        fmt.fmt.pix_mp.num_planes  = 2;
+        // NV12 plane 0 full resolution (Luma Y)
+        fmt.fmt.pix_mp.plane_fmt[0].sizeimage = CAPTURE_WIDTH * CAPTURE_HEIGHT;
+        fmt.fmt.pix_mp.plane_fmt[0].bytesperline = CAPTURE_WIDTH;
+        // NV12 plane 1 half resolution (Chroma UV)
+        fmt.fmt.pix_mp.plane_fmt[1].sizeimage = CAPTURE_WIDTH * CAPTURE_HEIGHT / 2;
+        fmt.fmt.pix_mp.plane_fmt[1].bytesperline = CAPTURE_WIDTH;
+    }
 
     if (xioctl(app->fd, VIDIOC_S_FMT, &fmt) == -1) {
         log_message("VIDIOC_S_FMT %d", errno);
@@ -361,26 +418,40 @@ int app_init(AppState *app, const char *dev_name) {
 
     // Check applied format
     struct v4l2_format fmt_check = {0};
-    fmt_check.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    fmt_check.type = app->type;
     xioctl(app->fd, VIDIOC_G_FMT, &fmt_check);
 
-    printf("Colorspace : %d  (1=SMPTE170M, 7=JPEG/full-range)\n",
-                fmt_check.fmt.pix_mp.colorspace);
-    printf("Quantization: %d (0=default, 1=full-range, 2=limited)\n",
-                fmt_check.fmt.pix_mp.quantization);
-    app->cap_width  = fmt.fmt.pix_mp.width;
-    app->cap_height = fmt.fmt.pix_mp.height;
-    int y_size  = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
-    int uv_size  = fmt.fmt.pix_mp.plane_fmt[1].sizeimage;
-    printf("Format : %dx%d, fourcc=%.4s [Ysz=%d, UVsz=%d]\n",
-           app->cap_width, app->cap_height,
-           (char *)&fmt.fmt.pix_mp.pixelformat,
-        y_size, uv_size);
+    if(app->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+        printf("Colorspace : %d  (1=SMPTE170M, 7=JPEG/full-range)\n",
+                    fmt_check.fmt.pix_mp.colorspace);
+        printf("Quantization: %d (0=default, 1=full-range, 2=limited)\n",
+                    fmt_check.fmt.pix_mp.quantization);
+        app->cap_width  = fmt.fmt.pix_mp.width;
+        app->cap_height = fmt.fmt.pix_mp.height;
+        int y_size  = fmt.fmt.pix_mp.plane_fmt[0].sizeimage;
+        int uv_size  = fmt.fmt.pix_mp.plane_fmt[1].sizeimage;
+        printf("Format : %dx%d, fourcc=%.4s [Ysz=%d, UVsz=%d]\n",
+            app->cap_width, app->cap_height,
+            (char *)&fmt.fmt.pix_mp.pixelformat,
+            y_size, uv_size);
+    } else {
+        printf("Colorspace : %d  (1=SMPTE170M, 7=JPEG/full-range, 8=V4L2_COLORSPACE_SRGB)\n",
+                    fmt_check.fmt.pix.colorspace);
+        printf("Quantization: %d (0=default, 1=full-range, 2=limited)\n",
+                    fmt_check.fmt.pix.quantization);
+        app->cap_width  = fmt.fmt.pix.width;
+        app->cap_height = fmt.fmt.pix.height;
+        int size  = fmt.fmt.pix.sizeimage;
+        printf("Format : %dx%d, fourcc=%.4s [sz=%d]\n",
+            app->cap_width, app->cap_height,
+            (char *)&fmt.fmt.pix.pixelformat,
+            size);
+    }
 
     // Request MMAP multi-planar buffers
     struct v4l2_requestbuffers req = {0};
     req.count  = N_BUFFERS;
-    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    req.type   = app->type;
     req.memory = V4L2_MEMORY_MMAP;
 
     if (xioctl(app->fd, VIDIOC_REQBUFS, &req) == -1) {
@@ -397,11 +468,13 @@ int app_init(AppState *app, const char *dev_name) {
     for (guint i = 0; i < app->n_buffers; i++) {
         struct v4l2_plane planes[VIDEO_MAX_PLANES] = {0};
         struct v4l2_buffer buf = {0};
-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index  = i;
-        buf.length = NUM_PLANES;
-        buf.m.planes = planes;
+        buf.type   = app->type;
+        if(app->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+            buf.length = NUM_PLANES;
+            buf.m.planes = planes;
+        }
 
         // Query NUM_PLANES for buffer #i
         if (xioctl(app->fd, VIDIOC_QUERYBUF, &buf) == -1) {
@@ -409,19 +482,34 @@ int app_init(AppState *app, const char *dev_name) {
             return -1;
         }
 
-        // mmap all planes
-        for (int p = 0; p < NUM_PLANES; p++) {
-            app->buffers[i].plane[p].length = planes[p].length;
-            app->buffers[i].plane[p].start  = mmap(NULL,
-                                        planes[p].length,
+        if(app->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+            // mmap all planes
+            for (int p = 0; p < NUM_PLANES; p++) {
+                app->buffers[i].plane[p].length = planes[p].length;
+                app->buffers[i].plane[p].start  = mmap(NULL,
+                                            planes[p].length,
+                                            PROT_READ | PROT_WRITE,
+                                            MAP_SHARED,
+                                            app->fd,
+                                            planes[p].m.mem_offset);
+                if (app->buffers[i].plane[p].start == MAP_FAILED) {
+                    log_message("mmap(%d): %s", errno, strerror(errno));
+                    return -1;
+                }
+            }
+        } else {
+            app->buffers[i].plane[0].length = buf.length;
+            app->buffers[i].plane[0].start  = mmap(NULL,
+                                        buf.length,
                                         PROT_READ | PROT_WRITE,
                                         MAP_SHARED,
                                         app->fd,
-                                        planes[p].m.mem_offset);
-            if (app->buffers[i].plane[p].start == MAP_FAILED) {
+                                        buf.m.offset);
+            if (app->buffers[i].plane[0].start == MAP_FAILED) {
                 log_message("mmap(%d): %s", errno, strerror(errno));
                 return -1;
             }
+            //
         }
 
     }
@@ -431,11 +519,13 @@ int app_init(AppState *app, const char *dev_name) {
         struct v4l2_plane planes[VIDEO_MAX_PLANES];
         memset(planes, 0, sizeof(planes));
         struct v4l2_buffer buf = {0};
-        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        buf.type   = app->type;
         buf.memory = V4L2_MEMORY_MMAP;
         buf.index  = i;
-        buf.length = NUM_PLANES;
-        buf.m.planes = planes;
+        if(app->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+            buf.length = NUM_PLANES;
+            buf.m.planes = planes;
+        }
 
         if (xioctl(app->fd, VIDIOC_QBUF, &buf) == -1) {
             log_message("VIDIOC_QBUF (init)");
@@ -445,7 +535,7 @@ int app_init(AppState *app, const char *dev_name) {
     }
 
     // Start streaming
-    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    enum v4l2_buf_type type = app->type;
     if (xioctl(app->fd, VIDIOC_STREAMON, &type) == -1) {
         log_message("VIDIOC_STREAMON (%d): %s", errno, strerror(errno));
         return -1;

@@ -42,6 +42,7 @@ typedef struct {
     int fd;
     Buffer buffers[N_BUFFERS];
     guint n_buffers;
+    guint type;
 
     GtkWidget *window;
     GtkWidget *drawing_area;
