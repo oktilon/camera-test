@@ -29,8 +29,6 @@ ninja -C build
 
 ## Usage
 
-Default device is `/dev/video0`, alternatively could be specified as first argument:
-
 ```bash
-./camera-test /dev/videoX
+./camera-test
 ```

@@ -33,14 +33,18 @@ configure_file(
 # Includes and sources
 inc = include_directories('src')
 src = [
-      'src/app.c'
+      'src/xdg-shell-client-protocol.c'
     , 'src/main.c'
 ]
+
+cc = meson.get_compiler('c')
+rtDep =cc.find_library('rt')
 
 # Dependencies
 deps = [
     # dependency('gtk+-3.0', static: true)
-    dependency('gtk+-3.0')
+      dependency('wayland-client')
+    , rtDep
 ]
 
 # Create executable
